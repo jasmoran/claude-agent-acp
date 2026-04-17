@@ -1579,6 +1579,7 @@ describe("session/close", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      resumeParams: { cwd: "/test", mcpServers: [] },
     };
     return agent.sessions[sessionId]!;
   }
@@ -1662,6 +1663,80 @@ describe("session/close", () => {
     ).rejects.toThrow();
 
     expect(agent.sessions["session-keep"]).toBeDefined();
+  });
+
+  it("records dormant params on /exit so a later prompt can resume", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "session-resume");
+
+    await agent.prompt({
+      sessionId: "session-resume",
+      prompt: [{ type: "text", text: "/exit" }],
+    });
+
+    expect(agent.sessions["session-resume"]).toBeUndefined();
+    expect(agent.dormantSessions.get("session-resume")).toEqual({
+      cwd: "/test",
+      mcpServers: [],
+    });
+  });
+
+  it("resumes a dormant session when a later prompt arrives", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "session-resume");
+
+    await agent.prompt({
+      sessionId: "session-resume",
+      prompt: [{ type: "text", text: "/exit" }],
+    });
+    expect(agent.dormantSessions.has("session-resume")).toBe(true);
+
+    // Stub out getOrCreateSession so we don't spin up a real Query — just
+    // reinject a fresh mock session under the same id and verify the prompt
+    // path invoked resumption with the dormant params. Mirrors the real
+    // createSession's cleanup of the dormant entry.
+    const resumeSpy = vi
+      .spyOn(agent as any, "getOrCreateSession")
+      .mockImplementation(async (params: any) => {
+        injectSession(agent, params.sessionId);
+        agent.dormantSessions.delete(params.sessionId);
+        return {
+          sessionId: params.sessionId,
+          modes: agent.sessions[params.sessionId]!.modes,
+          models: agent.sessions[params.sessionId]!.models,
+          configOptions: [],
+        };
+      });
+
+    // With a fresh (empty) mock query, the prompt falls through to the
+    // "did not end in result" guard. We only care that resumption fired
+    // with the dormant params and that the dormant entry was cleared.
+    await expect(
+      agent.prompt({
+        sessionId: "session-resume",
+        prompt: [{ type: "text", text: "hi again" }],
+      }),
+    ).rejects.toThrow();
+
+    expect(resumeSpy).toHaveBeenCalledWith({
+      sessionId: "session-resume",
+      cwd: "/test",
+      mcpServers: [],
+      _meta: undefined,
+    });
+    expect(agent.dormantSessions.has("session-resume")).toBe(false);
+    expect(agent.sessions["session-resume"]).toBeDefined();
+  });
+
+  it("throws when prompting an unknown sessionId with no dormant record", async () => {
+    const agent = createMockAgent();
+
+    await expect(
+      agent.prompt({
+        sessionId: "nobody",
+        prompt: [{ type: "text", text: "hello" }],
+      }),
+    ).rejects.toThrow("Session not found");
   });
 });
 

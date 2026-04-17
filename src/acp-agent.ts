@@ -123,6 +123,14 @@ const ZERO_USAGE = Object.freeze({
 
 const DEFAULT_CONTEXT_WINDOW = 200000;
 
+/** The subset of a NewSessionRequest needed to resurrect a session via
+ *  `getOrCreateSession` after it has been torn down (e.g. by /exit). */
+type SessionResumeParams = {
+  cwd: string;
+  mcpServers?: NewSessionRequest["mcpServers"];
+  _meta?: NewSessionRequest["_meta"];
+};
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
@@ -147,6 +155,10 @@ type Session = {
    *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
    *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
+  /** Original params used to create the session. Preserved so that if the
+   *  session is torn down by /exit, a later prompt can transparently resume it
+   *  with the same cwd / mcpServers / _meta. */
+  resumeParams?: SessionResumeParams;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -329,6 +341,10 @@ export class ClaudeAcpAgent implements Agent {
   sessions: {
     [key: string]: Session;
   };
+  /** Sessions torn down by /exit, keyed by sessionId. The stored params are
+   *  used to resurrect the session if the client sends another prompt for the
+   *  same id instead of opening a new session. */
+  dormantSessions: Map<string, SessionResumeParams> = new Map();
   client: AgentSideConnection;
   toolUseCache: ToolUseCache;
   backgroundTerminals: { [key: string]: BackgroundTerminal } = {};
@@ -556,7 +572,23 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
-    const session = this.sessions[params.sessionId];
+    let session = this.sessions[params.sessionId];
+    if (!session) {
+      // If the session was torn down by a previous /exit, transparently
+      // resume it so the client can keep using the same sessionId.
+      // createSession clears the dormant entry on success; if it throws,
+      // the entry stays so a subsequent prompt can retry.
+      const dormant = this.dormantSessions.get(params.sessionId);
+      if (dormant) {
+        await this.getOrCreateSession({
+          sessionId: params.sessionId,
+          cwd: dormant.cwd,
+          mcpServers: dormant.mcpServers,
+          _meta: dormant._meta,
+        });
+        session = this.sessions[params.sessionId];
+      }
+    }
     if (!session) {
       throw new Error("Session not found");
     }
@@ -565,6 +597,9 @@ export class ClaudeAcpAgent implements Agent {
     const firstPromptText = firstChunk?.type === "text" ? firstChunk.text.trim() : "";
     const firstPromptCommand = firstPromptText.split(/\s+/, 1)[0];
     if (EXIT_COMMANDS.has(firstPromptCommand)) {
+      if (session.resumeParams) {
+        this.dormantSessions.set(params.sessionId, session.resumeParams);
+      }
       await this.teardownSession(params.sessionId);
       return { stopReason: "end_turn" };
     }
@@ -1728,7 +1763,15 @@ export class ClaudeAcpAgent implements Agent {
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+      resumeParams: {
+        cwd: params.cwd,
+        mcpServers: params.mcpServers,
+        _meta: params._meta,
+      },
     };
+
+    // A new/replacement session supersedes any dormant record for the same id.
+    this.dormantSessions.delete(sessionId);
 
     return {
       sessionId,
