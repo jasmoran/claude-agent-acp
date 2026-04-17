@@ -182,6 +182,16 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       description: "Say hello (project)",
       input: { hint: "name" },
     });
+    expect(commands).toContainEqual({
+      name: "exit",
+      description: "Close the current session",
+      input: null,
+    });
+    expect(commands).toContainEqual({
+      name: "quit",
+      description: "Close the current session",
+      input: null,
+    });
 
     await connection.prompt({
       prompt: [
@@ -1615,6 +1625,43 @@ describe("session/close", () => {
 
     expect(agent.sessions["session-a"]).toBeUndefined();
     expect(agent.sessions["session-b"]).toBeDefined();
+  });
+
+  it.each(["/exit", "/quit", "/exit ignored args", "  /quit  "])(
+    "should tear down the session when prompt starts with %s",
+    async (prompt) => {
+      const agent = createMockAgent();
+      const session = injectSession(agent, "session-exit");
+
+      const response = await agent.prompt({
+        sessionId: "session-exit",
+        prompt: [{ type: "text", text: prompt }],
+      });
+
+      expect(response).toEqual({ stopReason: "end_turn" });
+      expect(agent.sessions["session-exit"]).toBeUndefined();
+      expect(session.query.interrupt).toHaveBeenCalled();
+      expect(session.settingsManager.dispose).toHaveBeenCalled();
+      expect(session.abortController.signal.aborted).toBe(true);
+    },
+  );
+
+  it("should not tear down the session when /exit appears mid-prompt", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "session-keep");
+
+    // The mock query generator is empty, so the prompt handler falls through
+    // to its "did not end in result" guard. We only care that the exit
+    // interception did *not* fire, which means the session should still be
+    // in the map after the prompt rejects.
+    await expect(
+      agent.prompt({
+        sessionId: "session-keep",
+        prompt: [{ type: "text", text: "please /exit now" }],
+      }),
+    ).rejects.toThrow();
+
+    expect(agent.sessions["session-keep"]).toBeDefined();
   });
 });
 

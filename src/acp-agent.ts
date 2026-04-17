@@ -282,6 +282,10 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
 
+// Slash commands we handle ourselves to close the active session without
+// involving the SDK or the model.
+const EXIT_COMMANDS = new Set(["/exit", "/quit"]);
+
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   auto: "auto",
   default: "default",
@@ -555,6 +559,14 @@ export class ClaudeAcpAgent implements Agent {
     const session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
+    }
+
+    const firstChunk = params.prompt[0];
+    const firstPromptText = firstChunk?.type === "text" ? firstChunk.text.trim() : "";
+    const firstPromptCommand = firstPromptText.split(/\s+/, 1)[0];
+    if (EXIT_COMMANDS.has(firstPromptCommand)) {
+      await this.teardownSession(params.sessionId);
+      return { stopReason: "end_turn" };
     }
 
     session.cancelled = false;
@@ -1944,6 +1956,11 @@ async function getAvailableModels(
   };
 }
 
+const BUILT_IN_COMMANDS: AvailableCommand[] = [
+  { name: "exit", description: "Close the current session", input: null },
+  { name: "quit", description: "Close the current session", input: null },
+];
+
 function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[] {
   const UNSUPPORTED_COMMANDS = [
     "cost",
@@ -1955,7 +1972,7 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
     "todos",
   ];
 
-  return commands
+  const sdkCommands = commands
     .map((command) => {
       const input = command.argumentHint
         ? {
@@ -1975,6 +1992,8 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
+
+  return [...sdkCommands, ...BUILT_IN_COMMANDS];
 }
 
 function formatUriAsLink(uri: string): string {
