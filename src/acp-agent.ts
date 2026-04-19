@@ -80,6 +80,20 @@ export const CLAUDE_CONFIG_DIR =
 
 const MAX_TITLE_LENGTH = 256;
 
+// The Claude Code CLI records typed slash commands and their local output
+// inline in the session transcript as XML-wrapped user messages, sometimes
+// concatenated with the user's real prompt. Strip the metadata wrappers so
+// history replay only shows the text the user actually typed.
+function stripLocalCommandMetadata(content: string): string {
+  return content
+    .replace(/<command-name>[\s\S]*?<\/command-name>/g, "")
+    .replace(/<command-message>[\s\S]*?<\/command-message>/g, "")
+    .replace(/<command-args>[\s\S]*?<\/command-args>/g, "")
+    .replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/g, "")
+    .replace(/<local-command-stderr>[\s\S]*?<\/local-command-stderr>/g, "")
+    .trim();
+}
+
 function sanitizeTitle(text: string): string {
   // Replace newlines and collapse whitespace
   const sanitized = text
@@ -1232,9 +1246,20 @@ export class ClaudeAcpAgent implements Agent {
     const messages = await getSessionMessages(sessionId);
 
     for (const message of messages) {
+      // The Claude Code CLI records slash commands and their local output
+      // inline in the user transcript, e.g.
+      // `<command-name>/model</command-name>...<local-command-stdout>...`
+      // sometimes followed by the user's real prompt. Strip the metadata
+      // so replay only surfaces what the user actually typed.
+      // @ts-expect-error - untyped in SDK but we handle all of these
+      let content = message.message.content;
+      if (message.type === "user" && typeof content === "string") {
+        content = stripLocalCommandMetadata(content);
+        if (content === "") continue;
+      }
+
       for (const notification of toAcpNotifications(
-        // @ts-expect-error - untyped in SDK but we handle all of these
-        message.message.content,
+        content,
         // @ts-expect-error - untyped in SDK but we handle all of these
         message.message.role,
         sessionId,
